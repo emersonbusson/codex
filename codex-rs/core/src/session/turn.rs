@@ -10,6 +10,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::collect_explicit_skill_mentions;
 use crate::compact::InitialContextInjection;
+use crate::compact::LastUserMessagePolicy;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact::should_use_remote_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
@@ -212,6 +213,7 @@ pub(crate) async fn run_turn(
     // However, we defer that drain until after sampling in two cases:
     // 1. At the start of a turn, so the fresh turn input in `input` gets sampled first.
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
+    let mut context_window_recovery_compacted = false;
 
     loop {
         // Note that pending_input would be something like a message the user
@@ -290,6 +292,7 @@ pub(crate) async fn run_turn(
                         &turn_context,
                         &mut client_session,
                         InitialContextInjection::BeforeLastUserMessage,
+                        LastUserMessagePolicy::Cap,
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
                     )
@@ -362,6 +365,38 @@ pub(crate) async fn run_turn(
             Err(CodexErr::TurnAborted) => {
                 // Aborted turn is reported via a different event.
                 break;
+            }
+            Err(CodexErr::ContextWindowExceeded) if !context_window_recovery_compacted => {
+                context_window_recovery_compacted = true;
+                info!(
+                    turn_id = %turn_context.sub_id,
+                    "sampling request exceeded the context window; attempting auto-compaction recovery"
+                );
+                let reset_client_session = match run_auto_compact(
+                    &sess,
+                    &turn_context,
+                    &mut client_session,
+                    InitialContextInjection::BeforeLastUserMessage,
+                    LastUserMessagePolicy::AlwaysInclude,
+                    CompactionReason::ContextLimit,
+                    CompactionPhase::MidTurn,
+                )
+                .await
+                {
+                    Ok(reset_client_session) => reset_client_session,
+                    Err(err) => {
+                        info!(
+                            turn_id = %turn_context.sub_id,
+                            "auto-compaction recovery failed after context window error: {err:#}"
+                        );
+                        break;
+                    }
+                };
+                if reset_client_session {
+                    client_session.reset_websocket_session();
+                }
+                can_drain_pending_input = false;
+                continue;
             }
             Err(CodexErr::InvalidImageRequest()) => {
                 {
@@ -710,6 +745,7 @@ async fn run_pre_sampling_compact(
             turn_context,
             client_session,
             InitialContextInjection::DoNotInject,
+            LastUserMessagePolicy::Cap,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
         )
@@ -766,6 +802,7 @@ async fn maybe_run_previous_model_inline_compact(
             &previous_model_turn_context,
             client_session,
             InitialContextInjection::DoNotInject,
+            LastUserMessagePolicy::Cap,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
         )
@@ -779,9 +816,12 @@ async fn run_auto_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
     initial_context_injection: InitialContextInjection,
+    last_user_message_policy: LastUserMessagePolicy,
     reason: CompactionReason,
     phase: CompactionPhase,
-) -> CodexResult<()> {
+) -> CodexResult<bool> {
+    // Remote compaction is server-side and does not apply the local 20k-token user-message cap,
+    // so the `last_user_message_policy` parameter is only honored by the inline (local) path.
     if should_use_remote_compact_task(turn_context.provider.info()) {
         if turn_context.features.enabled(Feature::RemoteCompactionV2) {
             emit_compact_metric(
@@ -798,7 +838,7 @@ async fn run_auto_compact(
                 phase,
             )
             .await?;
-            return Ok(());
+            return Ok(false);
         }
         emit_compact_metric(
             &sess.services.session_telemetry,
@@ -823,12 +863,13 @@ async fn run_auto_compact(
             Arc::clone(sess),
             Arc::clone(turn_context),
             initial_context_injection,
+            last_user_message_policy,
             reason,
             phase,
         )
         .await?;
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn collect_explicit_app_ids_from_skill_items(

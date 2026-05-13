@@ -25,7 +25,6 @@ use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::Verbosity;
-use codex_protocol::error::CodexErr;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -58,6 +57,7 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_compact_user_history_with_summary_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
@@ -2714,6 +2714,17 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
         ),
     )
     .await;
+    let compact_mock =
+        mount_compact_user_history_with_summary_once(&server, "RECOVERED_CONTEXT_SUMMARY").await;
+    let retry_mock = mount_sse_once_match(
+        &server,
+        body_string_contains("RECOVERED_CONTEXT_SUMMARY"),
+        sse(vec![
+            ev_response_created("resp_recovered"),
+            ev_completed("resp_recovered"),
+        ]),
+    )
+    .await;
 
     mount_sse_once_match(
         &server,
@@ -2789,17 +2800,19 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
         EFFECTIVE_CONTEXT_WINDOW
     );
 
-    let error_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
-    let expected_context_window_message = CodexErr::ContextWindowExceeded.to_string();
-    assert!(
-        matches!(
-            error_event,
-            EventMsg::Error(ref err) if err.message == expected_context_window_message
-        ),
-        "expected context window error; got {error_event:?}"
-    );
-
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    assert_eq!(
+        compact_mock.requests().len(),
+        1,
+        "context-window recovery should compact the conversation once"
+    );
+    assert!(
+        retry_mock
+            .requests()
+            .iter()
+            .any(|request| request.body_contains_text("RECOVERED_CONTEXT_SUMMARY")),
+        "context-window recovery should retry the sampling request"
+    );
 
     Ok(())
 }

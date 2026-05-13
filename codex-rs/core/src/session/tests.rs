@@ -9665,7 +9665,12 @@ async fn sample_rollout(
         .clone()
         .for_prompt(&reconstruction_turn.model_info.input_modalities);
     let user_messages1 = collect_user_messages(&snapshot1);
-    let rebuilt1 = compact::build_compacted_history(Vec::new(), &user_messages1, summary1);
+    let rebuilt1 = compact::build_compacted_history(
+        Vec::new(),
+        &user_messages1,
+        summary1,
+        compact::LastUserMessagePolicy::Cap,
+    );
     live_history.replace(rebuilt1);
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary1.to_string(),
@@ -9705,7 +9710,12 @@ async fn sample_rollout(
         .clone()
         .for_prompt(&reconstruction_turn.model_info.input_modalities);
     let user_messages2 = collect_user_messages(&snapshot2);
-    let rebuilt2 = compact::build_compacted_history(Vec::new(), &user_messages2, summary2);
+    let rebuilt2 = compact::build_compacted_history(
+        Vec::new(),
+        &user_messages2,
+        summary2,
+        compact::LastUserMessagePolicy::Cap,
+    );
     live_history.replace(rebuilt2);
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary2.to_string(),

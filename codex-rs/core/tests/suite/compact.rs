@@ -1704,6 +1704,215 @@ async fn auto_compact_runs_after_token_limit_hit() {
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn auto_compact_recovers_after_sampling_context_window_error() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let first_user = "RECOVERY_FIRST_USER";
+    let overflow_user = "RECOVERY_OVERFLOW_USER";
+    let recovery_summary = "RECOVERY_AUTO_SUMMARY";
+
+    let first_turn = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 50),
+    ]);
+    let context_window_error = sse_failed(
+        "resp-context-window",
+        "context_length_exceeded",
+        CONTEXT_LIMIT_MESSAGE,
+    );
+    let auto_compact_turn = sse(vec![
+        ev_assistant_message("m2", recovery_summary),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 20),
+    ]);
+    let retry_turn = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 20),
+    ]);
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            first_turn,
+            context_window_error,
+            auto_compact_turn,
+            retry_turn,
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_auto_compact_token_limit = Some(200_000);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: first_user.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit first turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: overflow_user.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit overflow turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "expected first turn, failed turn, recovery compact, and retry"
+    );
+    assert!(
+        requests[1].body_contains_text(overflow_user),
+        "failed sampling request should include the overflow user message"
+    );
+    assert!(
+        requests[2].body_contains_text(SUMMARIZATION_PROMPT),
+        "context-window recovery should run auto-compaction"
+    );
+    assert!(
+        requests[3].body_contains_text(first_user),
+        "retry should preserve earlier user messages after compaction"
+    );
+    assert!(
+        requests[3].body_contains_text(overflow_user),
+        "retry should preserve the user message that hit the context limit"
+    );
+    assert!(
+        requests[3].body_contains_text(recovery_summary),
+        "retry should include the recovery compaction summary"
+    );
+}
+
+// Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
+#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn auto_compact_recovery_preserves_multimodal_user_turn() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let overflow_user_text = "describe the attached screenshot in detail";
+    let overflow_image_url = "data:image/png;base64,LOCAL_OVERFLOW_PRESERVE_IMAGE";
+    let recovery_summary = "MULTIMODAL_RECOVERY_SUMMARY";
+
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse_failed(
+                "resp-overflow",
+                "context_length_exceeded",
+                CONTEXT_LIMIT_MESSAGE,
+            ),
+            sse(vec![
+                ev_assistant_message("m-compact", recovery_summary),
+                ev_completed_with_tokens("r-compact", /*total_tokens*/ 20),
+            ]),
+            sse(vec![
+                ev_assistant_message("m-retry", FINAL_REPLY),
+                ev_completed_with_tokens("r-retry", /*total_tokens*/ 20),
+            ]),
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_auto_compact_token_limit = Some(200_000);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            environments: None,
+            items: vec![
+                UserInput::Image {
+                    image_url: overflow_image_url.to_string(),
+                    detail: None,
+                },
+                UserInput::Text {
+                    text: overflow_user_text.to_string(),
+                    text_elements: Vec::new(),
+                },
+            ],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit multimodal overflow turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected overflow, recovery compact, and retry requests"
+    );
+    let retry_user_texts = requests[2].message_input_texts("user");
+    let retry_user_images = requests[2].message_input_image_urls("user");
+    assert_eq!(
+        retry_user_texts
+            .iter()
+            .filter(|text| text.as_str() == overflow_user_text)
+            .count(),
+        1,
+        "recovered retry must preserve the user's overflow text exactly once: {retry_user_texts:?}"
+    );
+    assert_eq!(
+        retry_user_images
+            .iter()
+            .filter(|url| url.as_str() == overflow_image_url)
+            .count(),
+        1,
+        "recovered retry must preserve the user's image input exactly once: {retry_user_images:?}"
+    );
+    assert!(
+        !requests[2]
+            .body_json()
+            .to_string()
+            .contains("tokens truncated"),
+        "AlwaysInclude policy must not truncate the current turn during recovery"
+    );
+}
+
+// Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
+#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn auto_compact_emits_context_compaction_items() {
     skip_if_no_network!();
 

@@ -63,6 +63,20 @@ pub(crate) enum InitialContextInjection {
     DoNotInject,
 }
 
+/// Controls how the most recent user message is treated when applying the per-history token cap
+/// during compaction.
+///
+/// `Cap` (default) applies `COMPACT_USER_MESSAGE_MAX_TOKENS` to every message including the most
+/// recent one. `AlwaysInclude` exempts the most recent user message from the cap entirely so that
+/// a sampling request which has just overflowed the context window — and is being recovered by
+/// mid-turn compaction — is retried with its current prompt intact. The cap still applies to all
+/// earlier user messages so the rest of history stays bounded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LastUserMessagePolicy {
+    Cap,
+    AlwaysInclude,
+}
+
 pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
     provider.supports_remote_compaction()
 }
@@ -71,6 +85,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
+    last_user_message_policy: LastUserMessagePolicy,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
@@ -86,6 +101,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         turn_context,
         input,
         initial_context_injection,
+        last_user_message_policy,
         CompactionTrigger::Auto,
         reason,
         phase,
@@ -112,6 +128,7 @@ pub(crate) async fn run_compact_task(
         turn_context,
         input,
         InitialContextInjection::DoNotInject,
+        LastUserMessagePolicy::Cap,
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
@@ -120,11 +137,13 @@ pub(crate) async fn run_compact_task(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    last_user_message_policy: LastUserMessagePolicy,
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -157,6 +176,7 @@ async fn run_compact_task_inner(
         input,
         initial_context_injection,
         compaction_metadata,
+        last_user_message_policy,
     )
     .await;
     let status = compaction_status_from_result(&result);
@@ -178,6 +198,7 @@ async fn run_compact_task_inner_impl(
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
+    last_user_message_policy: LastUserMessagePolicy,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
@@ -271,7 +292,12 @@ async fn run_compact_task_inner_impl(
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_user_messages(history_items);
 
-    let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+    let mut new_history = build_compacted_history(
+        Vec::new(),
+        &user_messages,
+        &summary_text,
+        last_user_message_policy,
+    );
 
     if matches!(
         initial_context_injection,
@@ -394,7 +420,7 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
     }
 }
 
-pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<String> {
+pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<Vec<UserInput>> {
     items
         .iter()
         .filter_map(|item| match crate::event_mapping::parse_turn_item(item) {
@@ -402,12 +428,53 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<String> {
                 if is_summary_message(&user.message()) {
                     None
                 } else {
-                    Some(user.message())
+                    Some(user.content)
                 }
             }
             _ => None,
         })
         .collect()
+}
+
+/// Joins the `UserInput::Text` segments of a structured user message into a single string for
+/// token-count purposes. Non-text inputs (images, mentions) contribute zero tokens to the cap.
+pub(crate) fn user_message_text(message: &[UserInput]) -> String {
+    message
+        .iter()
+        .filter_map(|item| match item {
+            UserInput::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Truncates the text segments of a structured user message so the total text token count fits
+/// within `remaining_tokens`. Non-text inputs (e.g. images) are preserved verbatim — only text is
+/// shortened, and segment order is preserved so callers can rebuild a faithful message.
+fn truncate_user_message(message: &[UserInput], remaining_tokens: usize) -> Vec<UserInput> {
+    let mut remaining_tokens = remaining_tokens;
+    let mut truncated = Vec::with_capacity(message.len());
+    for item in message {
+        match item {
+            UserInput::Text { text, .. } if remaining_tokens > 0 => {
+                let token_count = approx_token_count(text);
+                if token_count <= remaining_tokens {
+                    truncated.push(item.clone());
+                    remaining_tokens = remaining_tokens.saturating_sub(token_count);
+                } else {
+                    truncated.push(UserInput::Text {
+                        text: truncate_text(text, TruncationPolicy::Tokens(remaining_tokens)),
+                        text_elements: Vec::new(),
+                    });
+                    remaining_tokens = 0;
+                }
+            }
+            UserInput::Text { .. } => {}
+            _ => truncated.push(item.clone()),
+        }
+    }
+    truncated
 }
 
 pub(crate) fn is_summary_message(message: &str) -> bool {
@@ -473,36 +540,51 @@ pub(crate) fn insert_initial_context_before_last_real_user_or_summary(
 
 pub(crate) fn build_compacted_history(
     initial_context: Vec<ResponseItem>,
-    user_messages: &[String],
+    user_messages: &[Vec<UserInput>],
     summary_text: &str,
+    last_user_message_policy: LastUserMessagePolicy,
 ) -> Vec<ResponseItem> {
     build_compacted_history_with_limit(
         initial_context,
         user_messages,
         summary_text,
         COMPACT_USER_MESSAGE_MAX_TOKENS,
+        last_user_message_policy,
     )
 }
 
 fn build_compacted_history_with_limit(
     mut history: Vec<ResponseItem>,
-    user_messages: &[String],
+    user_messages: &[Vec<UserInput>],
     summary_text: &str,
     max_tokens: usize,
+    last_user_message_policy: LastUserMessagePolicy,
 ) -> Vec<ResponseItem> {
-    let mut selected_messages: Vec<String> = Vec::new();
+    // When the most recent user message must be preserved in full (mid-turn recovery), apply the
+    // per-history token cap only to earlier messages; the latest message bypasses the cap and is
+    // appended whole after the rest of history is selected.
+    let (messages_subject_to_cap, last_message_preserved): (
+        &[Vec<UserInput>],
+        Option<&Vec<UserInput>>,
+    ) = match (last_user_message_policy, user_messages.split_last()) {
+        (LastUserMessagePolicy::AlwaysInclude, Some((last, rest))) => (rest, Some(last)),
+        _ => (user_messages, None),
+    };
+
+    let mut selected_messages: Vec<Vec<UserInput>> = Vec::new();
     if max_tokens > 0 {
         let mut remaining = max_tokens;
-        for message in user_messages.iter().rev() {
+        for message in messages_subject_to_cap.iter().rev() {
             if remaining == 0 {
                 break;
             }
-            let tokens = approx_token_count(message);
+            let message_text = user_message_text(message);
+            let tokens = approx_token_count(&message_text);
             if tokens <= remaining {
                 selected_messages.push(message.clone());
                 remaining = remaining.saturating_sub(tokens);
             } else {
-                let truncated = truncate_text(message, TruncationPolicy::Tokens(remaining));
+                let truncated = truncate_user_message(message, remaining);
                 selected_messages.push(truncated);
                 break;
             }
@@ -510,15 +592,12 @@ fn build_compacted_history_with_limit(
         selected_messages.reverse();
     }
 
-    for message in &selected_messages {
-        history.push(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: message.clone(),
-            }],
-            phase: None,
-        });
+    if let Some(last) = last_message_preserved {
+        selected_messages.push(last.clone());
+    }
+
+    for message in selected_messages {
+        history.push(ResponseItem::from(ResponseInputItem::from(message)));
     }
 
     let summary_text = if summary_text.is_empty() {
